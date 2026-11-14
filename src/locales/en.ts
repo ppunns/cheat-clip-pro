@@ -67,6 +67,12 @@ export const en = {
 
     // Customization
     clipCustomizationTitle: "Clip Customization",
+    contentType: "Content Type",
+    contentPodcast: "Podcast / Talk",
+    contentFilm: "Film / Series",
+    contentFilmHint: "Scene-based picks (twists, emotion, action — incl. scenes without dialogue), any spoken language, clips aligned to camera cuts on uploaded files.",
+    filmTitleLanguage: "Title & caption language",
+    filmTitleSameAsVideo: "Same as film",
     targetDuration: "Target Clip Duration",
     dur15s: "15s clips",
     dur30s: "30s clips",

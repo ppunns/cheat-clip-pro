@@ -70,6 +70,12 @@ export const id: Translations = {
 
     // Customization
     clipCustomizationTitle: "Kustomisasi Klip",
+    contentType: "Jenis Konten",
+    contentPodcast: "Podcast / Obrolan",
+    contentFilm: "Film / Series",
+    contentFilmHint: "Pilih berdasarkan adegan (plot twist, emosi, aksi — termasuk adegan tanpa dialog), semua bahasa, dan klip dipotong pas pergantian shot untuk file upload.",
+    filmTitleLanguage: "Bahasa judul & caption",
+    filmTitleSameAsVideo: "Ikuti bahasa film",
     targetDuration: "Durasi Target Klip",
     dur15s: "Klip 15 dtk",
     dur30s: "Klip 30 dtk",

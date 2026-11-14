@@ -155,6 +155,8 @@ export interface RenderSettings {
   // Multi-Segment Merged Highlight Video
   renderMode?: 'separate' | 'merged';
   compilationTitle?: string;
+  design?: 'podcast' | 'film';
+  filmLabel?: string;
 }
 
 export interface RenderClipStatus {

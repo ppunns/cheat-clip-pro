@@ -6,15 +6,13 @@ import { CookiesModal } from './components/CookiesModal';
 import { CookieWarningModal } from './components/CookieWarningModal';
 import { ClipTrimmerModal } from './components/ClipTrimmerModal';
 import { AppUpdateModal } from './components/AppUpdateModal';
-import { resilientFetch } from './utils/api';
 import { getStoredCookies, hasStoredCookies } from './utils/cookieUtils';
 import { extractAudioFromVideoClient } from './utils/audioExtractor';
 import { renderClipClientSide, triggerBrowserDownload } from './services/clientRenderer';
 import { renderClipWebCodecs, isWebCodecsGpuSupported } from './services/webcodecsRenderer';
-import { isMobileDevice, requestWakeLock, releaseWakeLock } from './utils/deviceUtils';
+import { requestWakeLock, releaseWakeLock } from './utils/deviceUtils';
 import { LayoutMetricsSync } from './utils/layoutMetricsSync';
 import { useLanguage } from './locales';
-import { HackerApiKeyInput } from './components/HackerApiKeyInput';
 import {
   Play,
   Download,
@@ -55,7 +53,7 @@ declare global {
 }
 
 export default function App() {
-  const { t } = useLanguage();
+  const { t, language } = useLanguage();
   const [url, setUrl] = useState('');
   const [gdriveUrl, setGdriveUrl] = useState('');
   const [twitchUrl, setTwitchUrl] = useState('');
@@ -79,20 +77,22 @@ export default function App() {
     if (saved === '15s' || saved === '30s' || saved === '60s' || saved === 'auto') return saved;
     return '30s';
   });
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('cheat_clip_gemini_api_key') || '');
-  const [apiProvider, setApiProvider] = useState<'gemini' | 'openrouter'>(() => {
-    const saved = localStorage.getItem('cheat_clip_api_provider');
-    return (saved === 'openrouter' || saved === 'gemini') ? saved : 'gemini';
+  // Content type drives the AI analysis (podcast vs. scene-based film mode)
+  const [contentType, setContentType] = useState<'podcast' | 'film'>(() =>
+    localStorage.getItem('cheat_clip_content_type') === 'film' ? 'film' : 'podcast'
+  );
+  const [filmOutputLang, setFilmOutputLang] = useState<'auto' | 'id' | 'en'>(() => {
+    const saved = localStorage.getItem('cheat_clip_film_output_lang');
+    if (saved === 'auto' || saved === 'id' || saved === 'en') return saved;
+    return language === 'id' ? 'id' : 'auto';
   });
-  const [openRouterKey, setOpenRouterKey] = useState<string>(() => localStorage.getItem('cheat_clip_openrouter_key') || '');
-  const [openRouterModel, setOpenRouterModel] = useState<string>(() => {
-    const saved = localStorage.getItem('cheat_clip_openrouter_model');
-    return saved || 'google/gemini-2.5-flash';
-  });
-  const [openRouterModels, setOpenRouterModels] = useState<Array<{ id: string; name: string; description?: string; context_length?: number; recommended?: boolean }>>([]);
-  const [loadingOpenRouterModels, setLoadingOpenRouterModels] = useState(false);
-  const [customOpenRouterModel, setCustomOpenRouterModel] = useState<string>('');
-  const [isCustomOpenRouterModel, setIsCustomOpenRouterModel] = useState<boolean>(false);
+  const contentSuffix = contentType === 'film' ? `_film_${filmOutputLang}` : '';
+  const selectContentType = (type: 'podcast' | 'film') => {
+    setContentType(type);
+    localStorage.setItem('cheat_clip_content_type', type);
+    // Pre-select the matching render design in Clip Studio
+    localStorage.setItem('cheat_clip_simple_design', type);
+  };
   const [isCookiesModalOpen, setIsCookiesModalOpen] = useState(false);
   const [isUpdateModalOpen, setIsUpdateModalOpen] = useState(false);
   const [allowAppUpdates, setAllowAppUpdates] = useState<boolean>(() => {
@@ -131,18 +131,6 @@ export default function App() {
   }>>({});
   const [trimmerClip, setTrimmerClip] = useState<ViralClip | null>(null);
 
-  // AI model selection and custom focus prompt states
-  const [selectedModel, setSelectedModel] = useState<string>(() => {
-    const saved = localStorage.getItem('cheat_clip_selected_model');
-    // Auto-migrate outdated 1.0 models to gemini-2.5-flash
-    if (saved && (saved.includes('1.0') || saved.includes('vision'))) {
-      localStorage.setItem('cheat_clip_selected_model', 'gemini-2.5-flash');
-      return 'gemini-2.5-flash';
-    }
-    return saved || 'gemini-2.5-flash';
-  });
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [loadingModels, setLoadingModels] = useState(false);
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [targetClipCount, setTargetClipCount] = useState<number>(() => {
     const val = localStorage.getItem('cheat_clip_target_clip_count');
@@ -425,7 +413,7 @@ export default function App() {
 
     setIsLaunchingRender(true);
 
-    const isClientMode = !isMobileDevice() && (settings.hardwareAccel === 'browser_wasm' || settings.renderEngine === 'client' || (sourceMode === 'upload' && Boolean(uploadedVideoFile)));
+    const isClientMode = false; // Simplified: always render on server so podcast/film designs apply
 
     if (isClientMode) {
       try {
@@ -711,6 +699,8 @@ export default function App() {
             // Multi-Segment Merged Highlight Video
             render_mode: settings.renderMode || 'separate',
             compilation_title: settings.compilationTitle || null,
+            design: settings.design || null,
+            film_label: settings.filmLabel || null,
           },
           transcript: result.transcript,
         }),
@@ -804,6 +794,8 @@ export default function App() {
 
   // History feature: previously analyzed videos from localStorage
   interface HistoryEntry {
+    cache_key?: string;
+    ts_key?: string;
     video_id: string;
     title: string;
     duration_pref: string;
@@ -933,83 +925,7 @@ export default function App() {
     };
   }, [result]);
 
-  // Fetch available AI models when API key is detected/entered
-  useEffect(() => {
-    const fetchModels = async () => {
-      const cleanKey = apiKey.trim();
-      if (!cleanKey || cleanKey.length < 20 || cleanKey.toLowerCase() === 'mock') {
-        setAvailableModels([]);
-        return;
-      }
-      setLoadingModels(true);
-      try {
-        const res = await resilientFetch('/api/models', {
-          headers: {
-            'X-Gemini-API-Key': cleanKey,
-          },
-          maxRetries: 3,
-          retryDelay: 800,
-          silent: true
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.models && data.models.length > 0) {
-            setAvailableModels(data.models);
-            if (!data.models.includes(selectedModel) || selectedModel.includes('1.5') || selectedModel.includes('1.0')) {
-              const fallback = data.models.find((m: string) => m.includes('flash')) || data.models[0] || 'gemini-2.5-flash';
-              setSelectedModel(fallback);
-              localStorage.setItem('cheat_clip_selected_model', fallback);
-            }
-          }
-        }
-      } catch (err) {
-        console.error('Failed to retrieve available models:', err);
-      } finally {
-        setLoadingModels(false);
-      }
-    };
 
-    const delayDebounce = setTimeout(() => {
-      fetchModels();
-    }, 600);
-
-    return () => clearTimeout(delayDebounce);
-  }, [apiKey]);
-
-  // OpenRouter models retrieval
-  useEffect(() => {
-    let isCancelled = false;
-    const fetchOpenRouterModels = async () => {
-      setLoadingOpenRouterModels(true);
-      try {
-        const cleanKey = openRouterKey.trim();
-        const res = await resilientFetch('/api/openrouter-models', {
-          headers: cleanKey ? {
-            'X-OpenRouter-API-Key': cleanKey,
-            'Authorization': `Bearer ${cleanKey}`
-          } : undefined,
-          maxRetries: 2,
-          retryDelay: 800,
-          silent: true
-        });
-        if (res.ok && !isCancelled) {
-          const data = await res.json();
-          if (data.models && Array.isArray(data.models) && data.models.length > 0) {
-            setOpenRouterModels(data.models);
-          }
-        }
-      } catch (err) {
-        console.error('Failed to retrieve OpenRouter models:', err);
-      } finally {
-        if (!isCancelled) setLoadingOpenRouterModels(false);
-      }
-    };
-
-    fetchOpenRouterModels();
-    return () => {
-      isCancelled = true;
-    };
-  }, [openRouterKey]);
 
   // Sync marked clips with local storage based on active video ID
   useEffect(() => {
@@ -1110,6 +1026,8 @@ export default function App() {
             : `https://img.youtube.com/vi/${video_id}/mqdefault.jpg`;
 
           entries.push({
+            cache_key: key,
+            ts_key: tsKey,
             video_id,
             title: data.title,
             duration_pref,
@@ -1141,7 +1059,7 @@ export default function App() {
 
   const loadFromHistory = (entry: HistoryEntry) => {
     const rangeSuffix = entry.range_suffix || '';
-    const cacheKey = `cheat_clip_cache_${entry.video_id}_${entry.duration_pref}${rangeSuffix}`;
+    const cacheKey = entry.cache_key || `cheat_clip_cache_${entry.video_id}_${entry.duration_pref}${rangeSuffix}`;
     const raw = localStorage.getItem(cacheKey);
     if (!raw) return;
     try {
@@ -1241,35 +1159,16 @@ export default function App() {
         setCustomRangeEnd('');
       }
 
-      // Destroy any existing player immediately before state resets
+      // Load directly without artificial delay for fast & simple agent/user workflow
       destroyPlayer();
-      setLoading(true);
       setError(null);
-      setResult(null);
-      setActiveClip(null);
-      setCurrentStep(1);
-      setStepProgress({ 1: 100, 2: 0, 3: 0, 4: 0 });
-      setOverallProgress(25);
-      setLoadingDetails(t.loading.loadingFromHistory);
-      setTimeout(() => {
-        setCurrentStep(4);
-        setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 85 });
-        setOverallProgress(90);
-        setAiStage(t.loading.restoringHotspots);
-        setAiDetail(t.loading.reconstructingTimestamps);
-        setLoadingDetails(t.loading.reconstructingTimestamps);
-        setTimeout(() => {
-          setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 100 });
-          setOverallProgress(100);
-          setResult(data);
-          setWorkflowTab('clips');
-          setLoading(false);
-          setShowHistory(false);
-          if (data.clips?.length > 0) setActiveClip(data.clips[0]);
-          // Force recreate the player since we destroyed it
-          setTimeout(() => initPlayer(data.video_id, true), 150);
-        }, 500);
-      }, 600);
+      setLoading(false);
+      setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 100 });
+      setOverallProgress(100);
+      setResult(data);
+      setWorkflowTab('clips');
+      if (data.clips?.length > 0) setActiveClip(data.clips[0]);
+      setTimeout(() => initPlayer(data.video_id, true), 80);
     } catch (_) {
       setToastMessage(t.form.historyLoadFailed);
       setTimeout(() => setToastMessage(null), 3000);
@@ -1279,8 +1178,8 @@ export default function App() {
   const deleteHistoryEntry = (entry: HistoryEntry, e: React.MouseEvent) => {
     e.stopPropagation();
     const rangeSuffix = entry.range_suffix || '';
-    const cacheKey = `cheat_clip_cache_${entry.video_id}_${entry.duration_pref}${rangeSuffix}`;
-    const tsKey = `cheat_clip_ts_${entry.video_id}_${entry.duration_pref}${rangeSuffix}`;
+    const cacheKey = entry.cache_key || `cheat_clip_cache_${entry.video_id}_${entry.duration_pref}${rangeSuffix}`;
+    const tsKey = entry.ts_key || `cheat_clip_ts_${entry.video_id}_${entry.duration_pref}${rangeSuffix}`;
     localStorage.removeItem(cacheKey);
     localStorage.removeItem(tsKey);
     refreshHistory();
@@ -1670,10 +1569,6 @@ export default function App() {
 
   const handleFormSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (sourceMode === 'youtube' && subtitlesSource === 'youtube' && !skipLanguageConfirm) {
-      setShowLanguageConfirmModal(true);
-      return;
-    }
     handleAnalyze(e);
   };
 
@@ -1695,18 +1590,7 @@ export default function App() {
       if (!url.trim()) return;
     }
 
-    // Require an API key before making any request
-    if (apiProvider === 'gemini') {
-      if (!apiKey.trim()) {
-        setError(t.errors.apiKeyRequired);
-        return;
-      }
-    } else {
-      if (!openRouterKey.trim()) {
-        setError('OpenRouter API Key is required. Please paste your key in AI Engine Settings.');
-        return;
-      }
-    }
+
 
     let rangeStartSecs: number | undefined = undefined;
     let rangeEndSecs: number | undefined = undefined;
@@ -1757,7 +1641,6 @@ export default function App() {
       setCurrentStep(1);
       setStepProgress({ 1: 20, 2: 0, 3: 0, 4: 0 });
       setOverallProgress(5);
-      setActiveProcessingModel(selectedModel);
 
       if (!currentVideoInfo && uploadedVideoFile) {
         setIsUploadingVideo(true);
@@ -1843,47 +1726,20 @@ export default function App() {
     // Check localStorage cache first to avoid redundant API/Gemini processing (for YouTube URLs)
     if (sourceMode === 'youtube' && videoId) {
       const promptSuffix = customPrompt.trim() ? `_prompt_${customPrompt.trim().replace(/[^a-zA-Z0-9]/g, '_')}` : '';
-      const modelSuffix = `_model_${selectedModel}`;
       const clipsSuffix = clipCountMode === 'auto' ? '_clips_auto' : `_clips_${targetClipCount}`;
       const langSuffix = subtitlesSource === 'youtube' ? `_lang_${transcriptLanguage}` : '';
-      const cacheKey = `cheat_clip_cache_${videoId}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}`;
+      const cacheKey = `cheat_clip_cache_${videoId}_${durationPref}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}${contentSuffix}`;
 
       const cachedData = localStorage.getItem(cacheKey);
       if (cachedData) {
         try {
           const parsedData: AnalyzeResponse = JSON.parse(cachedData);
-
-          setLoading(true);
           setError(null);
-          setResult(null);
-          setActiveClip(null);
-          setCurrentStep(1);
-          setStepProgress({ 1: 100, 2: 0, 3: 0, 4: 0 });
-          setOverallProgress(25);
-          setLoadingDetails('Checking cache... Found matching clip analysis in memory!');
-
-          await new Promise(r => setTimeout(r, 300));
-          setCurrentStep(2);
-          setStepProgress({ 1: 100, 2: 100, 3: 0, 4: 0 });
-          setOverallProgress(50);
-          setLoadingDetails('Loading cached audience interest heatmap points...');
-          await new Promise(r => setTimeout(r, 300));
-          setCurrentStep(3);
-          setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 0 });
-          setOverallProgress(75);
-          setLoadingDetails(subtitlesSource === 'manual' ? 'Loading manual subtitles and transcript...' : 'Loading native subtitles and transcript...');
-          await new Promise(r => setTimeout(r, 300));
-          setCurrentStep(4);
+          setLoading(false);
           setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 100 });
           setOverallProgress(100);
-          setAiStage('Restoring Cached Highlights');
-          setAiDetail('Reconstructing engagement timestamps, viral hooks, and social metadata from memory...');
-          setLoadingDetails('Reconstructing viral hotspots...');
-          await new Promise(r => setTimeout(r, 250));
-
           setResult(parsedData);
           setWorkflowTab('clips');
-          setLoading(false);
 
           if (parsedData.clips && parsedData.clips.length > 0) {
             setActiveClip(parsedData.clips[0]);
@@ -1891,7 +1747,7 @@ export default function App() {
 
           setTimeout(() => {
             initPlayer(parsedData.video_id);
-          }, 100);
+          }, 80);
 
           return;
         } catch (e) {
@@ -1911,8 +1767,6 @@ export default function App() {
     const isGDrive = isGoogleDriveUrl(targetAnalyzeUrl);
     setAiStage(isGDrive ? 'Connecting to Google Drive' : 'Initializing Analysis Pipeline');
     setAiDetail(sourceMode === 'upload' ? 'Inspecting local video container & audio track...' : isGDrive ? 'Connecting to Google Drive and resolving video...' : 'Connecting to YouTube and resolving media stream metadata...');
-    const effectiveModel = apiProvider === 'openrouter' ? openRouterModel : selectedModel;
-    setActiveProcessingModel(effectiveModel);
     setLoadingDetails(sourceMode === 'upload' ? 'Inspecting local video file...' : isGDrive ? 'Connecting to Google Drive...' : 'Connecting to YouTube...');
 
     // Create AbortController for cancellation support
@@ -1930,11 +1784,6 @@ export default function App() {
         body: JSON.stringify({
           url: targetAnalyzeUrl,
           duration: durationPref,
-          api_key: apiProvider === 'gemini' ? (apiKey.trim() || undefined) : undefined,
-          model: apiProvider === 'gemini' ? selectedModel : undefined,
-          api_provider: apiProvider,
-          openrouter_key: apiProvider === 'openrouter' ? (openRouterKey.trim() || undefined) : undefined,
-          openrouter_model: apiProvider === 'openrouter' ? openRouterModel : undefined,
           custom_prompt: customPrompt.trim() || undefined,
           range_start: rangeStartSecs,
           range_end: rangeEndSecs,
@@ -1942,10 +1791,16 @@ export default function App() {
           subtitles_filename: subtitlesSource === 'manual' ? manualSubtitlesFileName : undefined,
           transcript_language: subtitlesSource === 'youtube' ? transcriptLanguage : undefined,
           target_clip_count: clipCountMode === 'auto' ? 'auto' : targetClipCount,
+          content_type: contentType,
+          output_language: contentType === 'film' && filmOutputLang !== 'auto' ? filmOutputLang : undefined,
           cookies: userCookies || undefined,
         }),
       });
 
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`Server error ${response.status}: ${errText.slice(0, 300) || response.statusText}`);
+      }
       if (!response.body) throw new Error('No response stream from server.');
 
       const reader = response.body.getReader();
@@ -2044,11 +1899,10 @@ export default function App() {
       if (resultData.video_id) {
         try {
           const promptSuffix = customPrompt.trim() ? `_prompt_${customPrompt.trim().replace(/[^a-zA-Z0-9]/g, '_')}` : '';
-          const modelSuffix = `_model_${selectedModel}`;
           const clipsSuffix = clipCountMode === 'auto' ? '_clips_auto' : `_clips_${targetClipCount}`;
           const langSuffix = subtitlesSource === 'youtube' ? `_lang_${transcriptLanguage}` : '';
-          const targetCacheKey = `cheat_clip_cache_${resultData.video_id}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}`;
-          const tsKey = `cheat_clip_ts_${resultData.video_id}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}`;
+          const targetCacheKey = `cheat_clip_cache_${resultData.video_id}_${durationPref}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}${contentSuffix}`;
+          const tsKey = `cheat_clip_ts_${resultData.video_id}_${durationPref}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}${contentSuffix}`;
 
           // Ensure persisted cache stores durable server URL, not temporary blob URL
           const persistData = {
@@ -2983,19 +2837,17 @@ Transcript:
           <button
             type="button"
             id="tab-step-clips"
-            className={`workflow-tab-btn ${workflowTab === 'clips' ? 'active' : ''} ${loading ? 'is-analyzing' : ''} ${result?.clips && result.clips.length > 0 ? 'step-has-content' : ''}`}
+            className={`workflow-tab-btn ${workflowTab === 'clips' ? 'active' : ''} ${loading ? 'is-analyzing' : ''} ${(result?.clips && result.clips.length > 0) || history.length > 0 ? 'step-has-content' : ''}`}
             onClick={() => {
+              refreshHistory();
               setWorkflowTab('clips');
             }}
-            disabled={!loading && !result && history.length === 0}
             title={
               loading
                 ? 'Sedang menganalisa video...'
                 : result
                   ? 'Lihat hasil rekomendasi klip'
-                  : history.length > 0
-                    ? 'Buka riwayat klip tersimpan'
-                    : 'Selesaikan analisis video terlebih dahulu'
+                  : 'Buka riwayat klip tersimpan'
             }
           >
             <span className="workflow-step-num">02</span>
@@ -3935,287 +3787,60 @@ Transcript:
             )}
 
             <div className="form-settings-grid">
-              {/* Card 1: AI Engine Configuration */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', padding: '1.25rem', borderRadius: 0, background: 'rgba(255, 255, 255, 0.02)', border: '1px solid rgba(255, 255, 255, 0.04)' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <h3 style={{ fontSize: '0.9rem', color: 'var(--primary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'flex', alignItems: 'center', gap: '0.4rem', margin: 0 }}>
-                    [AI] {t.form.aiSettingsTitle}
-                  </h3>
-                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontFamily: "'JetBrains Mono', monospace" }}>
-                    {apiProvider === 'gemini' ? 'ENGINE: GOOGLE_GEMINI' : 'ENGINE: OPENROUTER_MULTILLM'}
-                  </span>
-                </div>
-
-                {/* Provider Selection Tabs */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', background: '#0a0a0f', padding: '3px', border: '1px solid rgba(255, 0, 255, 0.2)' }}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setApiProvider('gemini');
-                      localStorage.setItem('cheat_clip_api_provider', 'gemini');
-                      setError(null);
-                    }}
-                    style={{
-                      padding: '0.55rem 0.75rem',
-                      background: apiProvider === 'gemini' ? '#ff00ff' : 'transparent',
-                      color: apiProvider === 'gemini' ? '#000000' : 'rgba(255, 255, 255, 0.7)',
-                      border: 'none',
-                      fontWeight: 700,
-                      fontFamily: "'JetBrains Mono', monospace",
-                      fontSize: '0.75rem',
-                      cursor: 'pointer',
-                      letterSpacing: '0.04em',
-                      transition: 'all 0.15s ease',
-                      boxShadow: apiProvider === 'gemini' ? '0 0 10px rgba(255, 0, 255, 0.4)' : 'none',
-                    }}
-                  >
-                    {t.form.providerGemini}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setApiProvider('openrouter');
-                      localStorage.setItem('cheat_clip_api_provider', 'openrouter');
-                      setError(null);
-                    }}
-                    style={{
-                      padding: '0.55rem 0.75rem',
-                      background: apiProvider === 'openrouter' ? '#ff00ff' : 'transparent',
-                      color: apiProvider === 'openrouter' ? '#000000' : 'rgba(255, 255, 255, 0.7)',
-                      border: 'none',
-                      fontWeight: 700,
-                      fontFamily: "'JetBrains Mono', monospace",
-                      fontSize: '0.75rem',
-                      cursor: 'pointer',
-                      letterSpacing: '0.04em',
-                      transition: 'all 0.15s ease',
-                      boxShadow: apiProvider === 'openrouter' ? '0 0 10px rgba(255, 0, 255, 0.4)' : 'none',
-                    }}
-                  >
-                    {t.form.providerOpenRouter}
-                  </button>
-                </div>
-
-                {/* Provider Content: GEMINI */}
-                {apiProvider === 'gemini' ? (
-                  <>
-                    {/* Gemini API Key input */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                      <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                        <span style={{ display: 'inline-flex', alignItems: 'center' }}>
-                          {t.form.apiKeyLabel}
-                          <span style={{ marginLeft: '0.4rem', fontSize: '0.7rem', fontWeight: 800, color: '#ff1e27', background: 'rgba(255, 30, 39, 0.15)', border: '1px solid #ff1e27', borderRadius: 0, padding: '0.1rem 0.45rem', letterSpacing: '0.05em', boxShadow: '0 0 8px rgba(255, 30, 39, 0.3)' }}>{t.form.apiKeyRequired}</span>
-                        </span>
-                        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                          <a
-                            href="https://aistudio.google.com/"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: '0.75rem', fontWeight: 600, transition: 'var(--transition-smooth)', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}
-                            className="action-link-btn"
-                          >
-                            <ExternalLink size={12} /> {t.form.getFreeKey}
-                          </a>
-                        </div>
-                      </label>
-                      <HackerApiKeyInput
-                        id="gemini-key-input"
-                        value={apiKey}
-                        onChange={(val) => {
-                          setApiKey(val);
-                          localStorage.setItem('cheat_clip_gemini_api_key', val);
-                          if (val.trim()) setError(null);
-                        }}
-                        disabled={loading}
-                        placeholder={t.form.apiKeyPlaceholder}
-                        error={!apiKey.trim()}
-                        revealLabel={t.form.revealKey}
-                        maskLabel={t.form.maskKey}
-                      />
-                      {!apiKey.trim() && (
-                        <span style={{ fontSize: '0.75rem', color: '#ff1e27', display: 'flex', alignItems: 'center', gap: '0.3rem', fontWeight: 600 }}>
-                          <AlertTriangle size={13} color="#ff1e27" />
-                          {t.form.apiKeyErrorHint}
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Gemini AI Model Selection */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                      <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                        <span>{t.form.aiModelLabel}</span>
-                        {loadingModels && (
-                          <span style={{ fontSize: '0.72rem', color: 'var(--primary)', animation: 'pulse 1.5s infinite ease-in-out' }}>
-                            ⏳ {t.form.fetchingModels}
-                          </span>
-                        )}
-                      </label>
-                      <select
-                        className="form-input"
-                        value={selectedModel}
-                        onChange={(e) => {
-                          setSelectedModel(e.target.value);
-                          localStorage.setItem('cheat_clip_selected_model', e.target.value);
-                        }}
-                        disabled={loading}
-                        style={{ padding: '0.6rem 1rem', fontSize: '0.875rem', height: '42px', cursor: 'pointer', appearance: 'auto', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', borderRadius: 0 }}
-                      >
-                        {availableModels.length > 0 ? (
-                          availableModels.map((m) => (
-                            <option key={m} value={m} style={{ background: '#0a0a0f', color: '#fff' }}>
-                              {m}
-                            </option>
-                          ))
-                        ) : (
-                          <>
-                            <option value="gemini-2.5-flash" style={{ background: '#0a0a0f', color: '#fff' }}>gemini-2.5-flash (Fast & recommended - Free tier friendly)</option>
-                            <option value="gemini-2.5-flash-lite" style={{ background: '#0a0a0f', color: '#fff' }}>gemini-2.5-flash-lite (Ultra-fast & lightweight)</option>
-                            <option value="gemini-2.0-flash" style={{ background: '#0a0a0f', color: '#fff' }}>gemini-2.0-flash (Fast & responsive)</option>
-                            <option value="gemini-2.0-flash-lite" style={{ background: '#0a0a0f', color: '#fff' }}>gemini-2.0-flash-lite (Lightweight flash)</option>
-                            <option value="gemini-1.5-flash" style={{ background: '#0a0a0f', color: '#fff' }}>gemini-1.5-flash (Fallback flash)</option>
-                            <option value="gemini-2.5-pro" style={{ background: '#0a0a0f', color: '#fff' }}>gemini-2.5-pro (Creative & complex - High quota)</option>
-                          </>
-                        )}
-                      </select>
-                      <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.4, marginTop: '0.2rem' }}>
-                        NOTE: <strong>{t.form.resilienceTip}</strong> {t.form.resilienceDesc}
-                      </span>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    {/* OpenRouter API Key input */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                      <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                        <span style={{ display: 'inline-flex', alignItems: 'center' }}>
-                          {t.form.openrouterKeyLabel}
-                          <span style={{ marginLeft: '0.4rem', fontSize: '0.7rem', fontWeight: 800, color: '#ff1e27', background: 'rgba(255, 30, 39, 0.15)', border: '1px solid #ff1e27', borderRadius: 0, padding: '0.1rem 0.45rem', letterSpacing: '0.05em', boxShadow: '0 0 8px rgba(255, 30, 39, 0.3)' }}>{t.form.apiKeyRequired}</span>
-                        </span>
-                        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                          <a
-                            href="https://openrouter.ai/settings/keys"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: '0.75rem', fontWeight: 600, transition: 'var(--transition-smooth)', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}
-                            className="action-link-btn"
-                          >
-                            <ExternalLink size={12} /> {t.form.openrouterGetFreeKey}
-                          </a>
-                        </div>
-                      </label>
-                      <HackerApiKeyInput
-                        id="openrouter-key-input"
-                        value={openRouterKey}
-                        onChange={(val) => {
-                          setOpenRouterKey(val);
-                          localStorage.setItem('cheat_clip_openrouter_key', val);
-                          if (val.trim()) setError(null);
-                        }}
-                        disabled={loading}
-                        placeholder={t.form.openrouterKeyPlaceholder}
-                        error={!openRouterKey.trim()}
-                        revealLabel={t.form.revealKey}
-                        maskLabel={t.form.maskKey}
-                      />
-                      {!openRouterKey.trim() && (
-                        <span style={{ fontSize: '0.75rem', color: '#f87171', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /></svg>
-                          {t.form.apiKeyErrorHint}
-                        </span>
-                      )}
-                    </div>
-
-                    {/* OpenRouter Model Selection */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                          {t.form.openrouterModelLabel}
-                        </label>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                          {loadingOpenRouterModels && (
-                            <span style={{ fontSize: '0.72rem', color: 'var(--primary)', animation: 'pulse 1.5s infinite ease-in-out' }}>
-                              ⏳ {t.form.fetchingModels}
-                            </span>
-                          )}
-                          <span
-                            onClick={() => setIsCustomOpenRouterModel(!isCustomOpenRouterModel)}
-                            style={{
-                              cursor: 'pointer',
-                              color: isCustomOpenRouterModel ? 'var(--primary)' : 'var(--text-muted)',
-                              fontSize: '0.72rem',
-                              fontFamily: "'JetBrains Mono', monospace",
-                              textDecoration: 'underline'
-                            }}
-                          >
-                            {isCustomOpenRouterModel ? '[SELECT PRESET]' : '[CUSTOM ID]'}
-                          </span>
-                        </div>
-                      </div>
-
-                      {isCustomOpenRouterModel ? (
-                        <input
-                          type="text"
-                          className="form-input"
-                          placeholder="e.g. qwen/qwen-2.5-72b-instruct or deepseek/deepseek-r1"
-                          value={customOpenRouterModel || openRouterModel}
-                          onChange={(e) => {
-                            const val = e.target.value.trim();
-                            setCustomOpenRouterModel(val);
-                            setOpenRouterModel(val);
-                            localStorage.setItem('cheat_clip_openrouter_model', val);
-                          }}
-                          disabled={loading}
-                          style={{ height: '42px', fontFamily: "'JetBrains Mono', monospace", fontSize: '0.85rem' }}
-                        />
-                      ) : (
-                        <select
-                          className="form-input"
-                          value={openRouterModel}
-                          onChange={(e) => {
-                            setOpenRouterModel(e.target.value);
-                            localStorage.setItem('cheat_clip_openrouter_model', e.target.value);
-                          }}
-                          disabled={loading}
-                          style={{ padding: '0.6rem 1rem', fontSize: '0.875rem', height: '42px', cursor: 'pointer', appearance: 'auto', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', borderRadius: 0 }}
-                        >
-                          {openRouterModels.length > 0 ? (
-                            openRouterModels.map((m) => (
-                              <option key={m.id} value={m.id} style={{ background: '#0a0a0f', color: '#fff' }}>
-                                {m.name || m.id} {m.recommended ? '[RECOMMENDED]' : ''}
-                              </option>
-                            ))
-                          ) : (
-                            <>
-                              <option value="google/gemini-2.5-flash" style={{ background: '#0a0a0f', color: '#fff' }}>Google: Gemini 2.5 Flash [RECOMMENDED]</option>
-                              <option value="google/gemini-2.0-flash-001" style={{ background: '#0a0a0f', color: '#fff' }}>Google: Gemini 2.0 Flash</option>
-                              <option value="anthropic/claude-3.5-sonnet" style={{ background: '#0a0a0f', color: '#fff' }}>Anthropic: Claude 3.5 Sonnet [RECOMMENDED]</option>
-                              <option value="anthropic/claude-3.5-haiku" style={{ background: '#0a0a0f', color: '#fff' }}>Anthropic: Claude 3.5 Haiku</option>
-                              <option value="deepseek/deepseek-chat" style={{ background: '#0a0a0f', color: '#fff' }}>DeepSeek: DeepSeek V3 [RECOMMENDED]</option>
-                              <option value="meta-llama/llama-3.3-70b-instruct" style={{ background: '#0a0a0f', color: '#fff' }}>Meta: Llama 3.3 70B Instruct</option>
-                              <option value="openai/gpt-4o-mini" style={{ background: '#0a0a0f', color: '#fff' }}>OpenAI: GPT-4o Mini</option>
-                              <option value="openai/gpt-4o" style={{ background: '#0a0a0f', color: '#fff' }}>OpenAI: GPT-4o</option>
-                              <option value="qwen/qwen-2.5-72b-instruct" style={{ background: '#0a0a0f', color: '#fff' }}>Qwen: Qwen 2.5 72B Instruct</option>
-                              <option value="mistralai/mistral-large-2411" style={{ background: '#0a0a0f', color: '#fff' }}>Mistral: Mistral Large 2</option>
-                              <option value="google/gemini-2.5-pro" style={{ background: '#0a0a0f', color: '#fff' }}>Google: Gemini 2.5 Pro</option>
-                            </>
-                          )}
-                        </select>
-                      )}
-                      <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.4, marginTop: '0.2rem', display: 'flex', alignItems: 'flex-start', gap: '0.35rem' }}>
-                        <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0, marginTop: '1px', opacity: 0.7 }}><path d="M8 1a7 7 0 1 1 0 14A7 7 0 0 1 8 1zm0 1.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM8 5a.75.75 0 1 1 0 1.5A.75.75 0 0 1 8 5zm-.75 2.5h1.5v4h-1.5v-4z"/></svg>
-                        <span><strong>Same-Family Fallback:</strong> {t.form.openrouterResilienceDesc}</span>
-                      </span>
-                    </div>
-                  </>
-                )}
-
-              </div>
-
               {/* Card 2: Clip Parameters & Focus */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', padding: '1.25rem', borderRadius: 0, background: 'rgba(255, 255, 255, 0.02)', border: '1px solid rgba(255, 255, 255, 0.04)' }}>
                 <h3 style={{ fontSize: '0.9rem', color: 'var(--secondary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.25rem' }}>
                   * {t.form.clipCustomizationTitle}
                 </h3>
+
+                {/* Content Type Selector (Podcast vs Film) */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t.form.contentType}</label>
+                  <div className="duration-selector" id="content-type-selector-group">
+                    <button
+                      type="button"
+                      className={`duration-btn ${contentType === 'podcast' ? 'active' : ''}`}
+                      onClick={() => selectContentType('podcast')}
+                      disabled={loading}
+                    >
+                      {t.form.contentPodcast}
+                    </button>
+                    <button
+                      type="button"
+                      className={`duration-btn ${contentType === 'film' ? 'active' : ''}`}
+                      onClick={() => selectContentType('film')}
+                      disabled={loading}
+                    >
+                      {t.form.contentFilm}
+                    </button>
+                  </div>
+                  {contentType === 'film' && (
+                    <>
+                      <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>{t.form.contentFilmHint}</span>
+                      <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)', marginTop: '0.25rem' }}>{t.form.filmTitleLanguage}</label>
+                      <div className="duration-selector" id="film-output-language-group">
+                        {([
+                          ['auto', t.form.filmTitleSameAsVideo],
+                          ['id', t.form.langIndonesian],
+                          ['en', t.form.langEnglish],
+                        ] as const).map(([val, label]) => (
+                          <button
+                            key={val}
+                            type="button"
+                            className={`duration-btn ${filmOutputLang === val ? 'active' : ''}`}
+                            onClick={() => {
+                              setFilmOutputLang(val);
+                              localStorage.setItem('cheat_clip_film_output_lang', val);
+                            }}
+                            disabled={loading}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
 
                 {/* Preferred Duration Selector */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
@@ -4714,12 +4339,8 @@ Transcript:
           </section>
         )}
 
-        {/* Tab 02: CLIPS / HISTORY SECTION */}
-        {workflowTab === 'clips' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', width: '100%' }}>
-
-            {/* Top-level Previously Analyzed Videos (History) Panel */}
-            {history.length > 0 && (
+        {/* Previously Analyzed Videos (History) Panel — visible on both 01 SOURCE and 02 CLIPS */}
+        {(workflowTab === 'source' || workflowTab === 'clips') && history.length > 0 && (
               <section
                 className="history-highlight-panel"
                 aria-label="Previously analyzed clips"
@@ -5099,7 +4720,11 @@ Transcript:
                   </div>
                 )}
               </section>
-            )}
+        )}
+
+        {/* Tab 02: CLIPS SECTION */}
+        {workflowTab === 'clips' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', width: '100%' }}>
 
             {/* Decoding Video / Analyzing Progress Section (strictly rendered in Process #2 under History) */}
             {loading && (
@@ -5735,7 +5360,7 @@ Transcript:
                           <Bot size={15} color="var(--primary)" />
                           <span>{t.results.aiModelBadge}</span>
                           <strong style={{ color: 'var(--primary)', fontWeight: 600 }}>
-                            {result.model || selectedModel}
+                            {result.model}
                           </strong>
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
@@ -6168,7 +5793,7 @@ Transcript:
             )}
 
             {/* If no video selected and no history in Tab 02 */}
-            {!result && history.length === 0 && (
+            {!loading && !result && history.length === 0 && (
               <div className="glass-panel" style={{ padding: '3.5rem 2rem', textAlign: 'center', borderRadius: 0, background: '#0a0a0f', border: '1px solid #201e2c' }}>
                 <span style={{ fontSize: '2rem', color: '#ff00ff', display: 'block', marginBottom: '1rem', fontFamily: 'var(--font-mono)', fontWeight: 800 }}>&gt;_</span>
                 <h3 style={{ fontSize: '1.1rem', color: '#fff', marginBottom: '0.5rem', fontWeight: 600 }}>Belum Ada Klip yang Dianalisis</h3>
@@ -6235,6 +5860,7 @@ Transcript:
               allowAppUpdates={allowAppUpdates}
               onOpenCookiesModal={() => setIsCookiesModalOpen(true)}
               onBackToClips={() => setWorkflowTab('clips')}
+              videoTitle={result?.title}
             />
           </div>
         )}
