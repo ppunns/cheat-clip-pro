@@ -100,8 +100,26 @@ async def render_single_batch_clip(
         skip_ass_title = False
         duration_sec = max(1.0, end_t - start_t)
 
+        # Fixed designs (podcast / film): red title box overlay
+        if settings.design in ("podcast", "film") and display_title:
+            try:
+                from backend.design_overlay import render_design_overlay_png
+                design_png = str(TEMP_DIR / f"{batch_id}_clip_{idx}_design.png")
+                rendered_overlay = await asyncio.to_thread(
+                    render_design_overlay_png,
+                    settings.design,
+                    display_title,
+                    design_png,
+                    settings.film_label,
+                )
+                if rendered_overlay and os.path.exists(rendered_overlay):
+                    title_overlay_path = rendered_overlay
+                    skip_ass_title = True
+            except Exception as ex:
+                logger.warning(f"Could not render design overlay: {ex}")
+
         # Check if title has emoji -> render transparent color emoji PNG overlay
-        if display_title and settings.title_position != "none" and has_emoji(display_title):
+        if not skip_ass_title and display_title and settings.title_position != "none" and has_emoji(display_title):
             title_png_filename = f"{batch_id}_clip_{idx}_title.png"
             title_png_path = str(TEMP_DIR / title_png_filename)
             try:
@@ -158,6 +176,11 @@ async def render_single_batch_clip(
                 )
             ass_filename = f"{batch_id}_clip_{idx}.ass"
             ass_path = str(TEMP_DIR / ass_filename)
+            # Film design: subtitle must sit inside the video area, not inside the red box below it.
+            # y≈1210 (pct=37) is comfortably above the film box top (y=1278) in both 16:9 and 9:16 layouts.
+            _sub_y_pct = settings.subtitle_y_percent
+            if settings.design == "film" and _sub_y_pct is None:
+                _sub_y_pct = 37.0
             await asyncio.to_thread(
                 generate_ass_file,
                 words=words,
@@ -172,7 +195,7 @@ async def render_single_batch_clip(
                 title_duration=settings.title_duration if settings.title_duration else "entire",
                 duration_seconds=duration_sec,
                 title_y_percent=settings.title_y_percent,
-                subtitle_y_percent=settings.subtitle_y_percent,
+                subtitle_y_percent=_sub_y_pct,
                 subtitle_position_mode=settings.subtitle_position_mode if settings.subtitle_position_mode else "bottom",
                 subtitle_center_y_percent=settings.subtitle_center_y_percent if settings.subtitle_center_y_percent is not None else 50.0,
                 skip_title=skip_ass_title,
@@ -463,6 +486,9 @@ async def render_merged_batch_clips(
         if settings.caption_style != "none" or (display_title and settings.title_position != "none" and not skip_ass_title):
             ass_filename = f"{batch_id}_merged.ass"
             ass_path = str(TEMP_DIR / ass_filename)
+            _sub_y_pct_merged = settings.subtitle_y_percent
+            if settings.design == "film" and _sub_y_pct_merged is None:
+                _sub_y_pct_merged = 37.0
             await asyncio.to_thread(
                 generate_ass_file,
                 words=merged_words,
@@ -477,7 +503,7 @@ async def render_merged_batch_clips(
                 title_duration=settings.title_duration if settings.title_duration else "entire",
                 duration_seconds=total_duration_sec,
                 title_y_percent=settings.title_y_percent,
-                subtitle_y_percent=settings.subtitle_y_percent,
+                subtitle_y_percent=_sub_y_pct_merged,
                 subtitle_position_mode=settings.subtitle_position_mode if settings.subtitle_position_mode else "bottom",
                 subtitle_center_y_percent=settings.subtitle_center_y_percent if settings.subtitle_center_y_percent is not None else 50.0,
                 skip_title=skip_ass_title,

@@ -15,6 +15,7 @@ from backend.config import (
     TEMP_DIR,
     UPLOADS_DIR,
     compute_audio_energy_heatmap,
+    get_ai_env_config,
     get_video_file_metadata,
     logger,
     transcribe_local_video_file,
@@ -52,7 +53,22 @@ from backend.services.youtube_service import (
     get_supadata_keys,
     get_supadata_usage_data,
 )
+from backend.utils.chunking import (
+    apportion_clip_range,
+    clips_within_window,
+    is_auth_error,
+    is_non_retryable_error,
+    is_rate_limit_error,
+    merge_chunk_clips,
+    split_transcript_windows,
+)
 from backend.utils.heatmap import get_average_heatmap_value
+from backend.utils.shots import snap_clips_to_shots
+from backend.services.film_prompt import (
+    build_film_analysis_lines,
+    build_film_prompt,
+    film_system_instruction,
+)
 from backend.utils.proxy import get_proxy_url
 from backend.utils.sse import _sse
 from backend.utils.text import (
@@ -67,6 +83,20 @@ from backend.utils.text import (
     get_twitch_canonical_url,
     canonical_video_url,
 )
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _fmt_ts(sec: float) -> str:
+    sec = int(max(0, sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _format_parsed_dict(data: dict, channel: str, lang_code: str) -> dict:
@@ -192,7 +222,8 @@ def health_check(refresh: bool = False):
     is_vercel = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
     keys = get_supadata_keys()
     proxy = get_proxy_url()
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
+    ai_cfg = get_ai_env_config()
+    has_gemini = bool(ai_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY"))
     supadata_info = get_supadata_usage_data(force=refresh) if keys else {
         "total_keys": 0,
         "total_limit": 0,
@@ -212,6 +243,8 @@ def health_check(refresh: bool = False):
         "allow_app_updates": is_update_allowed(),
         "proxy_configured": bool(proxy),
         "gemini_env_configured": has_gemini,
+        "default_model": ai_cfg.get("model"),
+        "api_endpoint": ai_cfg.get("api_endpoint"),
         "supadata_keys_count": len(keys),
         "supadata": supadata_info
     }
@@ -229,13 +262,17 @@ def list_available_models(
     x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-API-Key"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
-    """Fetches list of available Gemini models using the user's API key, prioritizing Flash models (newest first).
-    Accepts API key securely via X-Gemini-API-Key or Authorization Bearer header, with query parameter fallback.
-    """
+    """Fetches list of available models, prioritizing the default model from backend/.env."""
+    ai_cfg = get_ai_env_config()
+    default_model = ai_cfg.get("model") or "Clipper"
+    if ai_cfg.get("api_endpoint"):
+        return {"models": [default_model], "default_model": default_model, "api_endpoint": ai_cfg.get("api_endpoint")}
     token_from_auth = authorization.replace("Bearer ", "").strip() if (authorization and authorization.startswith("Bearer ")) else None
-    effective_key = (x_gemini_api_key or token_from_auth or api_key or "").strip()
+    effective_key = (x_gemini_api_key or token_from_auth or api_key or ai_cfg.get("api_key") or "").strip()
     models = list_available_gemini_models(effective_key)
-    return {"models": models}
+    if default_model and default_model not in models:
+        models.insert(0, default_model)
+    return {"models": models, "default_model": default_model}
 
 
 @router.get("/api/openrouter-models")
@@ -247,8 +284,9 @@ async def list_openrouter_models_endpoint(
     """Fetches list of available OpenRouter text-based LLM models.
     Accepts API key securely via X-OpenRouter-API-Key or Authorization Bearer header, with query parameter fallback.
     """
+    ai_cfg = get_ai_env_config()
     token_from_auth = authorization.replace("Bearer ", "").strip() if (authorization and authorization.startswith("Bearer ")) else None
-    effective_key = (x_openrouter_api_key or token_from_auth or api_key or "").strip()
+    effective_key = (x_openrouter_api_key or token_from_auth or api_key or ai_cfg.get("api_key") or "").strip()
     models = await fetch_openrouter_available_models(effective_key)
     return {"models": models}
 
@@ -258,18 +296,37 @@ async def analyze_video(request: AnalyzeRequest):
     """Stream real-time progress via Server-Sent Events, then deliver the final result."""
 
     async def stream():
-        api_provider = (request.api_provider or "gemini").lower().strip()
-        gemini_key = (request.api_key or os.environ.get("GEMINI_API_KEY") or '').strip()
-        openrouter_key = (request.openrouter_key or request.api_key or os.environ.get("OPENROUTER_API_KEY") or '').strip()
-        is_mock = (gemini_key.lower() == "mock") if api_provider == "gemini" else False
+        # Film mode: scene-based analysis, any spoken language, optional title translation.
+        is_film = (request.content_type or "podcast").strip().lower() == "film"
+        out_lang_req = (request.output_language or "").strip().lower()
+        if out_lang_req in ("in",):
+            out_lang_req = "id"
+        output_language = out_lang_req if (is_film and out_lang_req in ("id", "en")) else None
 
-        if api_provider == "openrouter":
+        ai_cfg = get_ai_env_config()
+        custom_endpoint = ai_cfg.get("api_endpoint", "").strip()
+        env_api_key = ai_cfg.get("api_key", "").strip()
+        env_model = ai_cfg.get("model", "").strip()
+
+        req_provider = (request.api_provider or "").lower().strip()
+        if req_provider in ("custom", "openrouter"):
+            api_provider = req_provider
+        elif custom_endpoint and req_provider != "gemini":
+            api_provider = "custom"
+        else:
+            api_provider = "gemini"
+
+        gemini_key = (request.api_key or env_api_key or os.environ.get("GEMINI_API_KEY") or '').strip()
+        openrouter_key = (request.openrouter_key or request.api_key or env_api_key or os.environ.get("OPENROUTER_API_KEY") or '').strip()
+        is_mock = (gemini_key.lower() == "mock")
+
+        if api_provider in ("custom", "openrouter"):
             if not openrouter_key:
-                yield _sse({"error": "OpenRouter API Key is required. Please enter it in AI Engine Settings.", "status": 400})
+                yield _sse({"error": "API Key is required in backend/.env.", "status": 400})
                 return
         else:
             if not gemini_key:
-                yield _sse({"error": "Gemini API Key is required. Enter it in the web interface.", "status": 400})
+                yield _sse({"error": "API Key is required in backend/.env.", "status": 400})
                 return
 
         # ── Step 1: Detect Source Type & Extract Metadata ───────────────────
@@ -433,7 +490,7 @@ async def analyze_video(request: AnalyzeRequest):
                     if not transcript_lines:
                         raise Exception("Custom subtitles parsed into empty array.")
                     check_man = validate_transcript_language(transcript_lines, title=title)
-                    if not check_man['is_supported']:
+                    if not check_man['is_supported'] and not is_film:
                         yield _sse({
                             "error": f"Bahasa subtitle tidak didukung: terdeteksi {check_man['name']}. Cheat Clip Pro hanya memproses bahasa Indonesia dan Inggris.",
                             "status": 400
@@ -475,7 +532,7 @@ async def analyze_video(request: AnalyzeRequest):
 
                 try:
                     task = asyncio.create_task(
-                        asyncio.to_thread(transcribe_local_video_file, uploaded_file_path, whisper_progress, expected_video_lang)
+                        asyncio.to_thread(transcribe_local_video_file, uploaded_file_path, whisper_progress, None if is_film else expected_video_lang, is_film)
                     )
                     try:
                         while not task.done():
@@ -513,7 +570,7 @@ async def analyze_video(request: AnalyzeRequest):
                             return
 
                     check_up = validate_transcript_language(transcript_lines, title=title)
-                    if not check_up['is_supported']:
+                    if not check_up['is_supported'] and not is_film:
                         yield _sse({
                             "error": (
                                 f"Video ini terdeteksi menggunakan percakapan dalam bahasa {check_up['name']}. "
@@ -611,7 +668,7 @@ async def analyze_video(request: AnalyzeRequest):
                     if not transcript_lines:
                         raise Exception("Custom subtitles parsed into empty array.")
                     check_man = validate_transcript_language(transcript_lines, expected_video_lang=None, title=title)
-                    if not check_man['is_supported']:
+                    if not check_man['is_supported'] and not is_film:
                         yield _sse({
                             "error": f"Bahasa subtitle tidak didukung: terdeteksi {check_man['name']}. Cheat Clip Pro hanya memproses bahasa Indonesia dan Inggris.",
                             "status": 400
@@ -708,7 +765,7 @@ async def analyze_video(request: AnalyzeRequest):
 
                 try:
                     w_task = asyncio.create_task(
-                        asyncio.to_thread(transcribe_local_video_file, audio_path, whisper_trans_progress, expected_video_lang)
+                        asyncio.to_thread(transcribe_local_video_file, audio_path, whisper_trans_progress, None if is_film else expected_video_lang, is_film)
                     )
                     while not w_task.done():
                         try:
@@ -857,7 +914,7 @@ async def analyze_video(request: AnalyzeRequest):
                     if not transcript_lines:
                         raise Exception("Custom subtitles parsed into empty array.")
                     check_man = validate_transcript_language(transcript_lines, expected_video_lang=None, title=title)
-                    if not check_man['is_supported']:
+                    if not check_man['is_supported'] and not is_film:
                         yield _sse({
                             "error": f"Bahasa subtitle tidak didukung: terdeteksi {check_man['name']}. Cheat Clip Pro hanya memproses bahasa Indonesia dan Inggris.",
                             "status": 400
@@ -923,7 +980,7 @@ async def analyze_video(request: AnalyzeRequest):
                     transcript_lines = await task
                     # Validate that fetched transcript is strictly ID or EN and matches authentic spoken audio
                     val = validate_transcript_language(transcript_lines, expected_video_lang=expected_video_lang, title=title)
-                    if not val['is_supported'] or val['mismatch_detected']:
+                    if not is_film and (not val['is_supported'] or val['mismatch_detected']):
                         logger.warning(f"Fetched YouTube transcript rejected by language validator: {val.get('error_message')}. Discarding to trigger Whisper AI fallback...")
                         transcript_lines = []
                         raise Exception(f"Transcript language validation rejected: {val.get('error_message')}")
@@ -1032,7 +1089,7 @@ async def analyze_video(request: AnalyzeRequest):
 
                             try:
                                 w_task = asyncio.create_task(
-                                    asyncio.to_thread(transcribe_local_video_file, audio_path, whisper_trans_progress, expected_video_lang)
+                                    asyncio.to_thread(transcribe_local_video_file, audio_path, whisper_trans_progress, None if is_film else expected_video_lang, is_film)
                                 )
                                 try:
                                     while not w_task.done():
@@ -1059,7 +1116,7 @@ async def analyze_video(request: AnalyzeRequest):
 
                             if transcript_lines:
                                 w_check = validate_transcript_language(transcript_lines, expected_video_lang=expected_video_lang, title=title)
-                                if not w_check['is_supported']:
+                                if not w_check['is_supported'] and not is_film:
                                     yield _sse({
                                         "error": (
                                             f"Audio video ini terdeteksi menggunakan percakapan dalam bahasa {w_check['name']}. "
@@ -1247,6 +1304,7 @@ async def analyze_video(request: AnalyzeRequest):
                 min_clips = max(1, N - 5)
                 max_clips = N + 5
             clip_range = f"{min_clips}-{max_clips}"
+            clip_min_total, clip_max_total = min_clips, max_clips
             clip_count_instruction = (
                 f"TARGET CLIP COUNT: Approximately {clip_range} clips. "
                 f"Identify the highest-quality, most viral segments within this range."
@@ -1264,6 +1322,7 @@ async def analyze_video(request: AnalyzeRequest):
                 auto_clip_target = "15-25"
 
             clip_range = f"{auto_clip_target} clips (AI-selected based on viral potential)"
+            clip_min_total, clip_max_total = (int(x) for x in auto_clip_target.split("-"))
             clip_count_instruction = (
                 f"DYNAMIC AUTO CLIP COUNT & TOPIC CURATION RULES:\n"
                 f"- Extract approximately {auto_clip_target} high-impact, standalone viral clips based on the most captivating moments in this video.\n"
@@ -1272,7 +1331,7 @@ async def analyze_video(request: AnalyzeRequest):
 
         # ── Step 4: Build prompt & Detect Language ─────────────────────────────
         detected_lang = detect_transcript_language(enriched_transcript, title)
-        if not detected_lang.get('is_supported', True):
+        if not detected_lang.get('is_supported', True) and not is_film:
             yield _sse({
                 "error": (
                     f"Transkrip video terdeteksi dalam bahasa {detected_lang.get('name')}. "
@@ -1283,7 +1342,7 @@ async def analyze_video(request: AnalyzeRequest):
             return
 
         lang_code = detected_lang.get('code', 'en')
-        if lang_code not in ('id', 'en'):
+        if lang_code not in ('id', 'en') and not is_film:
             yield _sse({
                 "error": f"Bahasa transkrip ({lang_code}) tidak valid. Cheat Clip Pro hanya memproses bahasa Indonesia dan Inggris.",
                 "status": 400
@@ -1293,14 +1352,31 @@ async def analyze_video(request: AnalyzeRequest):
         lang_name = detected_lang.get('name', 'English')
         logger.info(f"Detected video language: {lang_name} ({lang_code}) - confidence {detected_lang.get('confidence', 0.0)}")
 
+        # Film mode adds [NO DIALOGUE] markers for action / music scenes (prompt-only lines).
+        analysis_lines = (
+            build_film_analysis_lines(enriched_transcript, heatmap, start_bound, end_bound)
+            if is_film else enriched_transcript
+        )
+        spoken_lang_name = lang_name
+        output_lang_name = (
+            {"id": "Indonesian (Bahasa Indonesia)", "en": "English"}.get(output_language, lang_name)
+            if is_film and output_language and output_language != lang_code else lang_name
+        )
+        film_sys = film_system_instruction(output_lang_name, spoken_lang_name) if is_film else None
+        # Clip titles are attributed to the channel for podcasts; films have no "host".
+        title_subject = "" if is_film else channel
+
         transcript_dump = []
-        for line in enriched_transcript:
+        for line in analysis_lines:
             eng = f"|{line['engagement']:.2f}" if heatmap and line['engagement'] > 0 else ""
             transcript_dump.append(f"{line['start']:.1f}|{line['end']:.1f}{eng} {line['text']}")
 
+        # Full transcript is kept for chunked analysis (custom endpoint / OpenRouter).
+        # The single-call Gemini path still caps the line count.
+        full_transcript_dump = list(transcript_dump)
         MAX_LINES = 3500 if is_long_video else 2000
         if len(transcript_dump) > MAX_LINES:
-            logger.warning(f"Transcript {len(transcript_dump)} lines — truncating to {MAX_LINES}.")
+            logger.warning(f"Transcript {len(transcript_dump)} lines — truncating to {MAX_LINES} for single-call analysis.")
             transcript_dump = transcript_dump[:MAX_LINES]
 
         transcript_text = "\n".join(transcript_dump)
@@ -1350,9 +1426,29 @@ async def analyze_video(request: AnalyzeRequest):
 
         channel_context = f"- Channel / Host / Creator: {channel}\n" if channel else ""
 
-        prompt = (
+        def build_prompt(transcript_text: str, clip_range: str, clip_count_instruction: str, window_note: str = "") -> str:
+            if is_film:
+                return build_film_prompt(
+                    transcript_text=transcript_text,
+                    clip_range=clip_range,
+                    clip_count_instruction=clip_count_instruction,
+                    window_note=window_note,
+                    title=title,
+                    start_bound=start_bound,
+                    end_bound=end_bound,
+                    duration=duration,
+                    dur_range=dur_range,
+                    has_heatmap=bool(heatmap),
+                    spoken_lang_name=spoken_lang_name,
+                    spoken_lang_code=lang_code,
+                    output_lang_name=output_lang_name,
+                    duration_instruction=duration_instruction,
+                    custom_focus=(request.custom_prompt or "").strip(),
+                )
+            return (
             f"You are an expert viral video clip editor finding top clip candidates for TikTok, Instagram Reels, and YouTube Shorts.\n"
             f"Analyze this YouTube video transcript and find {clip_range} high-performing, standalone clip candidates.\n\n"
+            f"{window_note}"
             f"VIDEO CONTEXT:\n"
             f"- Video Title: {title}\n"
             f"{channel_context}"
@@ -1392,10 +1488,12 @@ async def analyze_video(request: AnalyzeRequest):
             f"Transcript (start|end[|interest] text):\n---\n{transcript_text}\n---\n\n"
             f"Rules: use exact seconds from transcript; clips must start/end at sentence boundaries; do not overlap.\n"
             f"Return clips sorted by virality_score desc."
-        )
+            )
 
-        requested_model = (request.model or 'gemini-2.5-flash').strip()
-        if any(dep in requested_model.lower() for dep in ['gemini-1.0', 'gemini-pro-vision']):
+        prompt = build_prompt(transcript_text, clip_range, clip_count_instruction)
+
+        requested_model = (request.model or request.openrouter_model or env_model or 'Clipper').strip()
+        if api_provider == "gemini" and any(dep in requested_model.lower() for dep in ['gemini-1.0', 'gemini-pro-vision']):
             logger.info(f"Requested model '{requested_model}' is outdated. Upgrading to gemini-2.5-flash.")
             requested_model = 'gemini-2.5-flash'
 
@@ -1409,118 +1507,240 @@ async def analyze_video(request: AnalyzeRequest):
             "message": f"Verified language: {lang_name}. Zero-translation rule enforced for {requested_model}."
         })
 
-        # ── Step 4: AI Model API call (Gemini or OpenRouter) with dynamic fallback and retry ───
+        # ── Step 4: AI Model API call (Custom Endpoint, OpenRouter, or Gemini) ───
         response = None
         last_error = None
         encountered_quota_error = None
         analysis_data = None
         successful_model = None
 
-        if api_provider == "openrouter":
-            req_open_model = (request.openrouter_model or request.model or "google/gemini-2.5-flash").strip()
-            models_to_try = get_openrouter_fallback_chain(req_open_model)
-            logger.info(f"OpenRouter model chain for {req_open_model}: {models_to_try}")
+        if api_provider in ("custom", "openrouter"):
+            req_open_model = (request.openrouter_model or request.model or env_model or "Clipper").strip()
+            use_custom_endpoint = api_provider == "custom" or bool(custom_endpoint)
+            if use_custom_endpoint:
+                models_to_try = [req_open_model]
+            else:
+                models_to_try = get_openrouter_fallback_chain(req_open_model)
+            logger.info(f"AI model chain for {req_open_model} (endpoint={custom_endpoint or 'OpenRouter'}): {models_to_try}")
 
-            for idx, model_name in enumerate(models_to_try):
-                next_model_hint = models_to_try[idx + 1] if idx + 1 < len(models_to_try) else None
-                MAX_RETRIES = 1
-                MODEL_TIMEOUT_SEC = 120.0
+            # ── Split long transcripts into overlapping time windows ─────────
+            # Previously the transcript was truncated, so the end of long podcasts was never analysed.
+            CHUNK_SEC = _env_float("AI_CHUNK_SECONDS", 1500.0)          # ~25 min per segment
+            CHUNK_THRESHOLD_SEC = CHUNK_SEC * 1.4                      # chunk videos longer than ~35 min
+            CHUNK_MAX_LINES = 1500
+            CHUNK_CONCURRENCY = max(1, int(_env_float("AI_CHUNK_CONCURRENCY", 2)))
+            MODEL_TIMEOUT_SEC = _env_float("AI_TIMEOUT_SECONDS", 150.0)
+            MAX_ATTEMPTS = max(1, int(_env_float("AI_MAX_ATTEMPTS", 3)))
 
-                for attempt in range(MAX_RETRIES):
-                    if attempt > 0:
-                        wait = 2
-                        yield _sse({
-                            "step": 4,
-                            "step_progress": 25,
-                            "overall_progress": 75,
-                            "stage": "Transient Retry",
-                            "detail": f"{model_name} busy — waiting {wait}s before retry...",
-                            "model": model_name,
-                            "message": f"{model_name} busy — waiting {wait}s before retry..."
-                        })
-                        await asyncio.sleep(wait)
+            transcript_span = (
+                float(analysis_lines[-1]["end"]) - float(analysis_lines[0]["start"])
+                if analysis_lines else 0.0
+            )
+            windows = []
+            if transcript_span > CHUNK_THRESHOLD_SEC or len(full_transcript_dump) > CHUNK_MAX_LINES:
+                windows = split_transcript_windows(
+                    analysis_lines, chunk_sec=CHUNK_SEC, overlap_sec=60.0, max_lines_per_chunk=CHUNK_MAX_LINES
+                )
 
-                    yield _sse({
-                        "step": 4,
-                        "step_progress": 18,
-                        "overall_progress": 74,
-                        "stage": "OpenRouter Neural Dispatch",
-                        "detail": f"Dispatched {len(transcript_dump)} lines to {model_name} via OpenRouter...",
-                        "model": model_name,
-                        "message": f"Calling OpenRouter model {model_name}..."
-                    })
-
-                    task = asyncio.create_task(analyze_with_openrouter(
-                        api_key=openrouter_key,
-                        model_name=model_name,
-                        prompt=prompt,
-                        timeout=MODEL_TIMEOUT_SEC
+            # Each job: (label, window_start, window_end, prompt)
+            chunk_jobs = []
+            if len(windows) > 1:
+                for w_idx, (ws, we, li, lj) in enumerate(windows):
+                    lo, hi = apportion_clip_range(clip_min_total, clip_max_total, we - ws, max(1.0, transcript_span))
+                    part_range = f"{lo}-{hi}"
+                    part_instruction = (
+                        f"TARGET CLIP COUNT FOR THIS SEGMENT: Approximately {part_range} clips. "
+                        f"Only pick genuinely strong, standalone moments from this segment; quality over quantity."
+                    )
+                    window_note = (
+                        f"SEGMENT {w_idx + 1} OF {len(windows)}: This transcript is only one part of a longer video, "
+                        f"covering {_fmt_ts(ws)} to {_fmt_ts(we)} ({int(ws)}s-{int(we)}s). "
+                        f"Every clip's start_time and end_time MUST lie inside this segment.\n\n"
+                    )
+                    chunk_text = "\n".join(full_transcript_dump[li:lj])
+                    chunk_jobs.append((
+                        f"{w_idx + 1}/{len(windows)}", ws, we,
+                        build_prompt(chunk_text, part_range, part_instruction, window_note),
                     ))
+                logger.info(f"Long transcript ({int(transcript_span)}s, {len(full_transcript_dump)} lines) split into {len(chunk_jobs)} segments.")
+            else:
+                # Single call: still drop clips the model placed outside the analysed range.
+                has_bounds = end_bound > start_bound
+                chunk_jobs.append((None, start_bound if has_bounds else None, end_bound if has_bounds else None, prompt))
+            n_jobs = len(chunk_jobs)
 
-                    call_start = asyncio.get_event_loop().time()
-                    timed_out = False
-                    while not task.done():
-                        done, _ = await asyncio.wait([task], timeout=1.5)
-                        if not done:
-                            elapsed = int(asyncio.get_event_loop().time() - call_start)
-                            if elapsed >= MODEL_TIMEOUT_SEC:
-                                logger.warning(f"OpenRouter {model_name} exceeded {MODEL_TIMEOUT_SEC}s timeout.")
-                                task.cancel()
-                                timed_out = True
-                                last_error = TimeoutError(f"{model_name} inference timed out after {MODEL_TIMEOUT_SEC}s")
-                                break
+            chunk_status = {}
+            fatal_error = {"err": None}
+            sem = asyncio.Semaphore(CHUNK_CONCURRENCY)
 
-                            step_prog = min(96, 20 + int(elapsed * 1.5))
-                            overall_prog = 70 + int(step_prog * 0.28)
-                            yield _sse({
-                                "step": 4,
-                                "keepalive": True,
-                                "step_progress": step_prog,
-                                "overall_progress": overall_prog,
-                                "stage": "AI Retention & Virality Synthesis",
-                                "detail": f"Analyzing video transcript moments using OpenRouter {model_name} ({elapsed}s)...",
-                                "model": model_name,
-                                "elapsed": elapsed,
-                                "message": f"[{model_name} | {elapsed}s] Analyzing moments..."
-                            })
+            async def run_chunk(job_idx, label, ws, we, chunk_prompt):
+                """Analyse one segment with retries + backoff, walking the model fallback chain."""
+                async with sem:
+                    last_exc = None
+                    for model_name in models_to_try:
+                        for attempt in range(1, MAX_ATTEMPTS + 1):
+                            if fatal_error["err"] is not None:
+                                raise fatal_error["err"]
+                            chunk_status[job_idx] = f"{model_name} (attempt {attempt}/{MAX_ATTEMPTS})"
+                            try:
+                                res = await asyncio.wait_for(
+                                    analyze_with_openrouter(
+                                        api_key=openrouter_key,
+                                        model_name=model_name,
+                                        prompt=chunk_prompt,
+                                        timeout=MODEL_TIMEOUT_SEC,
+                                        api_endpoint=custom_endpoint if use_custom_endpoint else None,
+                                        system_instruction_override=film_sys,
+                                    ),
+                                    timeout=MODEL_TIMEOUT_SEC + 15,
+                                )
+                                data = res.model_dump()
+                                clips = data.get("clips") or []
+                                if ws is not None:
+                                    clips = clips_within_window(clips, ws, we)
+                                # A single-call analysis with zero clips is worth one more try;
+                                # a quiet segment of a long video legitimately may have none.
+                                if not clips and label is None and attempt < MAX_ATTEMPTS:
+                                    raise ValueError(f"{model_name} returned 0 clips")
+                                chunk_status[job_idx] = "done"
+                                return {"summary": data.get("summary") or "", "clips": clips, "model": model_name}
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                if isinstance(e, asyncio.TimeoutError):
+                                    e = TimeoutError(f"{model_name} timed out after {int(MODEL_TIMEOUT_SEC)}s")
+                                last_exc = e
+                                logger.warning(f"AI segment {label or '1/1'} | {model_name} attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
+                                if is_auth_error(e):
+                                    fatal_error["err"] = e
+                                    raise e
+                                if is_non_retryable_error(e):
+                                    break  # try the next model in the chain
+                                if attempt < MAX_ATTEMPTS:
+                                    backoff = (5.0 if is_rate_limit_error(e) else 2.0) * (2 ** (attempt - 1))
+                                    chunk_status[job_idx] = f"retrying in {int(backoff)}s"
+                                    await asyncio.sleep(backoff)
+                    chunk_status[job_idx] = "failed"
+                    raise last_exc or RuntimeError("AI analysis failed")
 
-                    if timed_out:
+            yield _sse({
+                "step": 4,
+                "step_progress": 18,
+                "overall_progress": 74,
+                "stage": "AI Neural Dispatch",
+                "detail": (
+                    f"Dispatched {len(full_transcript_dump)} lines to {models_to_try[0]} in {n_jobs} segments..."
+                    if n_jobs > 1 else f"Dispatched {len(full_transcript_dump)} lines to {models_to_try[0]}..."
+                ),
+                "model": models_to_try[0],
+                "message": f"Calling AI model {models_to_try[0]}..."
+            })
+
+            tasks = [asyncio.create_task(run_chunk(i, *job)) for i, job in enumerate(chunk_jobs)]
+            call_start = asyncio.get_event_loop().time()
+            try:
+                pending = set(tasks)
+                while pending:
+                    _, pending = await asyncio.wait(pending, timeout=1.5)
+                    if fatal_error["err"] is not None:
                         break
-
-                    try:
-                        validated_res = await task
-                        analysis_data = validated_res.model_dump()
-                        successful_model = model_name
-                        logger.info(f"OpenRouter analysis succeeded using {successful_model} with {len(analysis_data.get('clips', []))} clips.")
+                    if not pending:
                         break
-                    except Exception as e:
-                        last_error = e
-                        logger.warning(f"Error from OpenRouter {model_name}: {e}")
-                        err_str = str(e).lower()
-                        if any(x in err_str for x in ('429', 'quota', 'credit', 'rate limit', 'balance')):
-                            encountered_quota_error = e
-                        break
-
-                if analysis_data:
-                    break
-                elif next_model_hint:
+                    elapsed = int(asyncio.get_event_loop().time() - call_start)
+                    n_done = sum(1 for t in tasks if t.done())
+                    step_prog = min(96, 20 + int(70 * n_done / n_jobs) + min(6, elapsed // 10))
+                    active = [f"#{i + 1}: {st}" for i, st in sorted(chunk_status.items()) if st not in ("done", "failed")]
+                    if n_jobs > 1:
+                        detail = f"Segments analysed {n_done}/{n_jobs} ({elapsed}s) — " + (", ".join(active[:3]) or "finishing")
+                    else:
+                        detail = f"Analyzing video transcript moments using {chunk_status.get(0, models_to_try[0])} ({elapsed}s)..."
                     yield _sse({
                         "step": 4,
-                        "step_progress": 35,
-                        "overall_progress": 76,
-                        "stage": "OpenRouter Model Fallback",
-                        "detail": f"{model_name} issue — switching to {next_model_hint} within same family...",
-                        "model": next_model_hint,
-                        "message": f"Switching to OpenRouter fallback model {next_model_hint}..."
+                        "keepalive": True,
+                        "step_progress": step_prog,
+                        "overall_progress": 70 + int(step_prog * 0.28),
+                        "stage": "AI Retention & Virality Synthesis",
+                        "detail": detail,
+                        "model": models_to_try[0],
+                        "elapsed": elapsed,
+                        "message": f"[{models_to_try[0]} | {elapsed}s] {detail}"
+                    })
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            results, errors = [], []
+            for t in tasks:
+                if t.cancelled():
+                    continue
+                exc = t.exception()
+                if exc is not None:
+                    errors.append(exc)
+                else:
+                    results.append(t.result())
+            for e in errors:
+                last_error = e
+                if is_rate_limit_error(e):
+                    encountered_quota_error = e
+
+            if fatal_error["err"] is not None:
+                yield _sse({
+                    "error": f"AI endpoint rejected the API key ({req_open_model}): {fatal_error['err']}. Check api_key in backend/.env.",
+                    "status": 401
+                })
+                return
+
+            if results:
+                if n_jobs > 1:
+                    merged_clips = merge_chunk_clips([r["clips"] for r in results], max_clips=clip_max_total)
+                else:
+                    merged_clips = results[0]["clips"]
+                analysis_data = {
+                    "summary": next((r["summary"] for r in results if r["summary"]), ""),
+                    "clips": merged_clips,
+                }
+                successful_model = results[0]["model"]
+                logger.info(
+                    f"AI analysis succeeded using {successful_model}: {len(results)}/{n_jobs} segments, "
+                    f"{len(merged_clips)} clips after merge."
+                )
+                if errors:
+                    yield _sse({
+                        "step": 4,
+                        "step_progress": 90,
+                        "overall_progress": 95,
+                        "stage": "Partial Segment Results",
+                        "detail": f"{len(errors)} of {n_jobs} segments failed after retries — using clips from the other {len(results)}.",
+                        "model": successful_model,
+                        "message": f"{len(errors)}/{n_jobs} segments failed — continuing with the rest."
                     })
 
             if analysis_data is None:
-                err_report = str(encountered_quota_error or last_error or "OpenRouter analysis failed.")
-                yield _sse({
-                    "error": f"OpenRouter Error: {err_report}",
-                    "status": 500
-                })
-                return
+                if enriched_transcript:
+                    logger.warning(
+                        f"AI model {req_open_model} returned error/empty ({last_error}); "
+                        f"falling back to smart transcript & heatmap clip synthesis."
+                    )
+                    yield _sse({
+                        "step": 4,
+                        "step_progress": 88,
+                        "overall_progress": 92,
+                        "stage": "Smart Transcript & Heatmap Synthesis",
+                        "detail": f"Synthesizing viral clips directly from transcript & retention peaks ({req_open_model})...",
+                        "model": req_open_model,
+                        "message": f"Synthesizing viral clips from transcript & retention peaks..."
+                    })
+                    analysis_data = {"summary": "", "clips": []}
+                    successful_model = req_open_model
+                else:
+                    err_report = str(encountered_quota_error or last_error or "AI analysis failed.")
+                    yield _sse({
+                        "error": f"AI Model Error ({req_open_model}): {err_report}",
+                        "status": 500
+                    })
+                    return
         else:
             client = genai.Client(api_key=gemini_key, http_options=types.HttpOptions(timeout=120000))
             
@@ -1574,6 +1794,7 @@ async def analyze_video(request: AnalyzeRequest):
                         model=model_name,
                         contents=prompt,
                         config=types.GenerateContentConfig(
+                            system_instruction=film_sys,
                             response_mime_type="application/json",
                             response_schema=VideoAnalysis,
                             temperature=0.2,
@@ -1650,13 +1871,13 @@ async def analyze_video(request: AnalyzeRequest):
                                     "summary": getattr(parsed, 'summary', ''),
                                     "clips": [
                                         {
-                                            "title": sanitize_first_person_title(getattr(c, 'title', ''), channel, lang=lang_code),
+                                            "title": sanitize_first_person_title(getattr(c, 'title', ''), title_subject, lang=lang_code),
                                             "start_time": getattr(c, 'start_time', 0.0),
                                             "end_time": getattr(c, 'end_time', 0.0),
                                             "hook_time": getattr(c, 'hook_time', None),
                                             "virality_score": getattr(c, 'virality_score', 0),
                                             "key_quotes": getattr(c, 'key_quotes', []),
-                                            "title_suggestion": sanitize_first_person_title(getattr(c, 'title_suggestion', ''), channel, lang=lang_code),
+                                            "title_suggestion": sanitize_first_person_title(getattr(c, 'title_suggestion', ''), title_subject, lang=lang_code),
                                             "caption_suggestion": getattr(c, 'caption_suggestion', ''),
                                             "hashtag_suggestion": getattr(c, 'hashtag_suggestion', ''),
                                         }
@@ -1666,7 +1887,7 @@ async def analyze_video(request: AnalyzeRequest):
                         
                         # Lenient fallback parser (repairs truncated/unescaped JSON from text)
                         if parsed_data is None and hasattr(resp_candidate, 'text') and resp_candidate.text:
-                            parsed_data = parse_lenient_json_analysis(resp_candidate.text, channel, lang_code)
+                            parsed_data = parse_lenient_json_analysis(resp_candidate.text, title_subject, lang_code)
 
                         if parsed_data is not None:
                             clips_found = len(parsed_data.get('clips', []))
@@ -1767,14 +1988,17 @@ async def analyze_video(request: AnalyzeRequest):
         # Fallback clip synthesis if 0 clips were returned after all models
         if len(analysis_data.get('clips', [])) == 0 and enriched_transcript:
             logger.info("Generating fallback clips from heatmap and transcript segments...")
+            desired_fallback_count = min(max(target_count_num if (not is_auto_clip_count and target_count_num) else 8, 5), 15)
             sorted_lines = sorted(enriched_transcript, key=lambda l: l.get('engagement', 0.0), reverse=True)
             candidate_starts = []
+            min_gap = max(15.0, min(35.0, (duration / max(desired_fallback_count + 1, 2)) * 0.6)) if duration > 0 else 25.0
             for l in sorted_lines:
                 s = l['start']
-                if not any(abs(s - existing) < 25.0 for existing in candidate_starts):
+                if not any(abs(s - existing) < min_gap for existing in candidate_starts):
                     candidate_starts.append(s)
-                if len(candidate_starts) >= 5:
+                if len(candidate_starts) >= desired_fallback_count:
                     break
+            candidate_starts.sort()
             
             fallback_clips_list = []
             for i, st in enumerate(candidate_starts):
@@ -1783,44 +2007,57 @@ async def analyze_video(request: AnalyzeRequest):
                 elif request.duration == "60s":
                     target_len = 60.0
                 elif request.duration == "auto":
-                    auto_lens = [25.0, 45.0, 75.0, 35.0, 60.0, 85.0, 20.0, 50.0]
+                    auto_lens = [35.0, 45.0, 60.0, 30.0, 50.0, 75.0, 25.0, 55.0]
                     target_len = auto_lens[i % len(auto_lens)]
                 else:
                     target_len = 30.0
-                et = min(duration, st + min(90.0, target_len))
-                seg_lines = [l['text'] for l in enriched_transcript if max(l['start'], st) < min(l['end'], et)]
+                et = min(duration, st + min(90.0, target_len)) if duration > 0 else (st + target_len)
+                seg_lines = [l['text'].strip() for l in enriched_transcript if max(l['start'], st) < min(l['end'], et) and l.get('text', '').strip()]
                 seg_text = " ".join(seg_lines).strip()
-                preview = seg_text[:60] + "..." if len(seg_text) > 60 else seg_text or f"Viral Highlight #{i+1}"
+                preview = seg_text[:80] + "..." if len(seg_text) > 80 else seg_text or f"Viral Highlight #{i+1}"
+                
+                # Build a natural hook title from the first meaningful line in the segment
+                raw_hook = seg_lines[0] if seg_lines else ""
+                words = [w for w in raw_hook.split() if w.strip()]
+                hook_snippet = " ".join(words[:7]).strip(" ,.;:!?\"'")
+                if hook_snippet:
+                    hook_snippet = sanitize_first_person_title(hook_snippet[:1].upper() + hook_snippet[1:], title_subject, lang=lang_code)
+                
+                quotes = [line[:90] for line in seg_lines[:2] if len(line) > 5] or ([seg_text[:80]] if seg_text else [])
+                score = max(72, int(95 - i * 3))
+                
                 if lang_code == 'id':
+                    clip_title = hook_snippet if len(hook_snippet) >= 8 else f"Momen Menarik #{i+1}: {title[:35]}"
                     fallback_clips_list.append({
-                        "title": f"Momen Menarik #{i+1}",
+                        "title": clip_title,
                         "start_time": st,
                         "end_time": et,
                         "hook_time": st,
-                        "virality_score": max(70, int(95 - i * 5)),
-                        "key_quotes": [seg_text[:80]] if seg_text else [],
-                        "title_suggestion": f"Cuplikan Pilihan #{i+1}",
-                        "caption_suggestion": f"Momen terbaik dari video: {preview} #viral #trending",
-                        "hashtag_suggestion": "#viral #shorts #trending"
+                        "virality_score": score,
+                        "key_quotes": quotes,
+                        "title_suggestion": clip_title,
+                        "caption_suggestion": f"Cuplikan penting dari \"{title}\": {preview} #viral #trending #indonesia",
+                        "hashtag_suggestion": "#viral #shorts #trending #fyp #indonesia"
                     })
                 else:
+                    clip_title = hook_snippet if len(hook_snippet) >= 8 else f"Key Highlight #{i+1}: {title[:35]}"
                     fallback_clips_list.append({
-                        "title": f"Key Highlight #{i+1}",
+                        "title": clip_title,
                         "start_time": st,
                         "end_time": et,
                         "hook_time": st,
-                        "virality_score": max(70, int(95 - i * 5)),
-                        "key_quotes": [seg_text[:80]] if seg_text else [],
-                        "title_suggestion": f"Must Watch Moment #{i+1}",
-                        "caption_suggestion": f"Key highlight from video: {preview} #viral #trending",
-                        "hashtag_suggestion": "#viral #shorts #trending"
+                        "virality_score": score,
+                        "key_quotes": quotes,
+                        "title_suggestion": clip_title,
+                        "caption_suggestion": f"Key moment from \"{title}\": {preview} #viral #trending #shorts",
+                        "hashtag_suggestion": "#viral #shorts #trending #fyp #highlights"
                     })
             analysis_data['clips'] = fallback_clips_list
             if not analysis_data.get('summary'):
                 if lang_code == 'id':
-                    analysis_data['summary'] = f"Analisis video \"{title}\" menemukan {len(fallback_clips_list)} segmen cuplikan pilihan. #viral #highlights"
+                    analysis_data['summary'] = f"Analisis video \"{title}\" berhasil mengekstrak {len(fallback_clips_list)} segmen cuplikan potensial berdasarkan transkrip & engagement. #viral #highlights #trending"
                 else:
-                    analysis_data['summary'] = f"Analysis of \"{title}\" identifying {len(fallback_clips_list)} key segments. #viral #highlights"
+                    analysis_data['summary'] = f"Analysis of \"{title}\" extracted {len(fallback_clips_list)} high-engagement segments from transcript & heatmap. #viral #highlights #trending"
 
         clip_count = len(analysis_data.get('clips', []))
         yield _sse({
@@ -1899,17 +2136,53 @@ async def analyze_video(request: AnalyzeRequest):
             hashtag_sug = lowercase_hashtags_in_string(raw_clip.get('hashtag_suggestion', ''))
             
             final_clips.append(ViralClip(
-                title=sanitize_first_person_title(raw_clip.get('title', ''), channel, lang=lang_code),
+                title=sanitize_first_person_title(raw_clip.get('title', ''), title_subject, lang=lang_code),
                 start_time=start,
                 end_time=end,
                 hook_time=hook,
                 virality_score=raw_clip.get('virality_score', 0),
                 key_quotes=raw_clip.get('key_quotes') or [],
                 transcript=" ".join(clip_lines),
-                title_suggestion=sanitize_first_person_title(raw_clip.get('title_suggestion', ''), channel, lang=lang_code),
+                title_suggestion=sanitize_first_person_title(raw_clip.get('title_suggestion', ''), title_subject, lang=lang_code),
                 caption_suggestion=caption_sug,
                 hashtag_suggestion=hashtag_sug
             ))
+
+        # ── Film mode: snap clip boundaries to nearby camera cuts ───────────
+        # Only possible when the video file is local (upload / Google Drive).
+        if is_film and final_clips and uploaded_file_path is not None and Path(uploaded_file_path).exists():
+            yield _sse({
+                "step": 4,
+                "step_progress": 99,
+                "overall_progress": 99,
+                "stage": "Shot Cut Alignment",
+                "detail": f"Aligning {len(final_clips)} clips to the nearest camera cuts...",
+                "message": f"Aligning {len(final_clips)} clips to camera cuts..."
+            })
+            try:
+                snapped = await asyncio.to_thread(
+                    snap_clips_to_shots,
+                    str(uploaded_file_path),
+                    [(c.start_time, c.end_time) for c in final_clips],
+                    start_bound,
+                    end_bound,
+                    max(5.0, min_target_duration * 0.8),
+                )
+                n_snapped = 0
+                for c, (ns, ne) in zip(final_clips, snapped):
+                    if (ns, ne) == (c.start_time, c.end_time):
+                        continue
+                    n_snapped += 1
+                    c.start_time, c.end_time = ns, ne
+                    if c.hook_time is None or not (ns <= c.hook_time <= ne):
+                        c.hook_time = ns
+                    c.transcript = " ".join(
+                        line.get("text", "") for line in enriched_transcript
+                        if max(line.get("start", 0.0), ns) < min(line.get("end", 0.0), ne)
+                    )
+                logger.info(f"Film mode: snapped {n_snapped}/{len(final_clips)} clips to shot cuts.")
+            except Exception as e:
+                logger.warning(f"Shot cut alignment skipped: {e}")
 
         # Enforce max constraint of ~200 clips for auto clip count
         if is_auto_clip_count and len(final_clips) > 200:

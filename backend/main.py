@@ -11,6 +11,7 @@ import backend.config
 from backend.config import logger
 from backend.routers import (
     analyze_router,
+    clip_job_router,
     cookies_router,
     downloads_router,
     media_router,
@@ -144,6 +145,7 @@ async def sanitized_exception_handler(request: Request, exc: Exception):
 
 # Include Modular Routers
 app.include_router(analyze_router)
+app.include_router(clip_job_router)
 app.include_router(render_router)
 app.include_router(media_router)
 app.include_router(cookies_router)

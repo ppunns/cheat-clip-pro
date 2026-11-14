@@ -724,11 +724,13 @@ def compute_audio_energy_heatmap(file_path: Union[str, Path], duration: float, n
 def transcribe_local_video_file(
     file_path: Union[str, Path],
     progress_callback=None,
-    target_language: Optional[str] = None
+    target_language: Optional[str] = None,
+    film_mode: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Transcribes speech from a local video or audio file using OpenAI Whisper.
-    Strictly focuses on Bahasa Indonesia or English.
+    Podcast mode focuses on Bahasa Indonesia or English. Film mode auto-detects any
+    language and drops segments Whisper hallucinates over music / silence.
     Returns standard transcript segments formatted as:
     [{"text": "...", "start": 0.0, "duration": 3.5}, ...]
     """
@@ -736,15 +738,15 @@ def transcribe_local_video_file(
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
 
+    if progress_callback:
+        progress_callback("Running Whisper AI", f"Loading Whisper model (first run may download it) and extracting dialogue from {p.name}...", 30)
+
     whisper_model = get_whisper_model()
     if whisper_model is None:
         raise RuntimeError(
             "Whisper speech recognition model could not be loaded on this system. "
             "Please ensure `openai-whisper` is installed and FFmpeg is in PATH."
         )
-
-    if progress_callback:
-        progress_callback("Running Whisper AI", f"Extracting dialogue from {p.name} with Whisper...", 30)
 
     logger.info(f"Transcribing local file with Whisper: {p} (target_language={target_language})")
     whisper_prompt = (
@@ -759,6 +761,11 @@ def transcribe_local_video_file(
         "condition_on_previous_text": False,
         "initial_prompt": whisper_prompt,
     }
+    if film_mode:
+        # Films can be in any language: no ID/EN-biased prompt, let Whisper detect the language.
+        transcribe_kwargs.pop("initial_prompt", None)
+        if target_language not in ("id", "en"):
+            target_language = None
     if target_language in ("id", "en"):
         transcribe_kwargs["language"] = target_language
 
@@ -788,9 +795,13 @@ def transcribe_local_video_file(
     segments = result.get("segments", [])
     transcript_lines = []
 
+    dropped = 0
     for seg in segments:
         text = seg.get("text", "").strip()
         if not text:
+            continue
+        if film_mode and _is_whisper_hallucination(seg):
+            dropped += 1
             continue
         start = round(float(seg.get("start", 0.0)), 2)
         end = round(float(seg.get("end", start + 2.0)), 2)
@@ -801,8 +812,22 @@ def transcribe_local_video_file(
             "duration": dur
         })
 
-    logger.info(f"Whisper transcribed {len(transcript_lines)} dialogue segments from {p.name}")
+    if dropped:
+        logger.info(f"Whisper film mode: dropped {dropped} likely-hallucinated segments (music/silence).")
+    logger.info(f"Whisper transcribed {len(transcript_lines)} dialogue segments from {p.name} (language={result.get('language')})")
     return transcript_lines
+
+
+def _is_whisper_hallucination(seg: Dict[str, Any]) -> bool:
+    """Whisper's standard heuristics: text over non-speech audio, or degenerate repetition."""
+    no_speech = float(seg.get("no_speech_prob", 0.0) or 0.0)
+    avg_logprob = float(seg.get("avg_logprob", 0.0) or 0.0)
+    compression = float(seg.get("compression_ratio", 0.0) or 0.0)
+    if no_speech > 0.6 and avg_logprob < -1.0:
+        return True
+    if compression > 2.4:
+        return True
+    return False
 
 
 def download_clip_segment(
@@ -2141,9 +2166,9 @@ def generate_ass_file(
         primary_color = "&H00FFFFFF"
         outline_color = "&H00000000"
         back_color = "&H80000000"
-        highlight_color = "&H0000E6FF"  # #FFE600 Lemon Yellow
-        outline_w = 4.8
-        shadow_w = 2.0
+        highlight_color = "&H00000099"  # #990000 matches design red box
+        outline_w = 6.5
+        shadow_w = 3.0
     elif style_preset == "beast_punch":
         primary_color = "&H00FFFFFF"
         outline_color = "&H00111111"
@@ -2186,6 +2211,9 @@ def generate_ass_file(
         highlight_color = "&H00E0E0E0"
         outline_w = 3.6
         shadow_w = 1.8
+
+    # TikTok-pop animation flags (active word scales in, inactive words dim)
+    use_pop = style_preset in ("viral_pop", "beast_punch")
 
     # Title styling: clean transparent background across ALL formats (no black box border)
     title_box_back = "&H00000000"
@@ -2319,15 +2347,29 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for idx, item in enumerate(chunk):
                     w_txt = item["word_text"]
                     if idx == active_idx:
-                        # Highlight active word with color only (no font scale or bold toggle so metrics stay 100% identical)
-                        line_parts.append(r"{\c" + highlight_color + r"\3c" + outline_color + r"}" + w_txt + r"{\c" + primary_color + r"\3c" + outline_color + r"}")
+                        if use_pop:
+                            # TikTok pop: scale 85%→110% over 90ms + highlight color
+                            line_parts.append(
+                                r"{\fscx85\fscy85\t(0,90,\fscx110\fscy110)\c" + highlight_color +
+                                r"\3c" + outline_color + r"}" + w_txt +
+                                r"{\fscx100\fscy100\c" + primary_color + r"\3c" + outline_color + r"}"
+                            )
+                        else:
+                            line_parts.append(r"{\c" + highlight_color + r"\3c" + outline_color + r"}" + w_txt + r"{\c" + primary_color + r"\3c" + outline_color + r"}")
                     else:
-                        line_parts.append(w_txt)
+                        if use_pop:
+                            # Inactive words: dimmed to ~47% opacity so active word pops
+                            line_parts.append(r"{\1a&H88&}" + w_txt + r"{\1a&H00&}")
+                        else:
+                            line_parts.append(w_txt)
 
                 styled_line = " ".join(line_parts)
-                # Lock position to sub_y with \q2\an{sub_align}\pos(center_x, sub_y)
+                # Fade-in the chunk on its first time slice (smooth entrance)
+                pos_tags = f"\\q2\\an{sub_align}\\pos({center_x},{sub_y})"
+                if active_idx == 0 and use_pop:
+                    pos_tags += "\\fad(70,0)"
                 events.append(
-                    f"Dialogue: 0,{format_ass_timestamp(w_start)},{format_ass_timestamp(w_end)},SubStyle,,0,0,0,,{{\\q2\\an{sub_align}\\pos({center_x},{sub_y})}}{styled_line}"
+                    f"Dialogue: 0,{format_ass_timestamp(w_start)},{format_ass_timestamp(w_end)},SubStyle,,0,0,0,,{{{pos_tags}}}{styled_line}"
                 )
 
     ass_content = ass_header + "\n".join(events) + "\n"
