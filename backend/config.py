@@ -13,7 +13,7 @@ if not hasattr(os, 'uname'):
     UnameResult = namedtuple('UnameResult', ['sysname', 'nodename', 'release', 'version', 'machine'])
     os.uname = lambda: UnameResult('Windows', 'localhost', '10', '10.0', 'AMD64')
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 
 # Path & Environment safety utilities
 def get_system_path() -> str:
@@ -41,13 +41,56 @@ try:
 except Exception:
     pass
 
-# Automatically load environment variables from backend/.env or root .env
+# Automatically load environment variables from backend/.env or root .env.
+# backend/.env.template is documentation only and is never loaded (it is tracked by git).
 _base_dir = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_base_dir, ".env"))
+load_dotenv(os.path.join(_base_dir, ".env"), override=True)
 load_dotenv(os.path.join(_base_dir, "..", ".env"))
 load_dotenv()
 
 ROOT_DIR = Path(_base_dir).parent
+
+
+def get_ai_env_config() -> dict:
+    """Dynamically reads AI configuration from backend/.env (falling back to root .env)
+    so changes to api_endpoint, api_key, and model take effect immediately.
+    Later files win, so backend/.env overrides the root .env."""
+    merged = {}
+    for env_path in (
+        os.path.join(_base_dir, "..", ".env"),
+        os.path.join(_base_dir, ".env"),
+    ):
+        if os.path.exists(env_path):
+            try:
+                vals = dotenv_values(env_path)
+                for k, v in vals.items():
+                    if v is not None and str(v).strip() != "":
+                        merged[k] = str(v).strip()
+            except Exception:
+                pass
+
+    # Sync into os.environ as well
+    for k, v in merged.items():
+        os.environ[k] = v
+
+    def _pick(*keys: str) -> str:
+        for k in keys:
+            val = merged.get(k) or os.environ.get(k)
+            if val and str(val).strip():
+                return str(val).strip()
+        return ""
+
+    api_endpoint = _pick("api_endpoint", "API_ENDPOINT", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+    api_key = _pick("api_key", "API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY")
+    model = _pick("model", "MODEL", "AI_MODEL")
+    if not model:
+        model = "Clipper" if api_endpoint else "gemini-2.5-flash"
+
+    return {
+        "api_endpoint": api_endpoint,
+        "api_key": api_key,
+        "model": model,
+    }
 
 # Setup logging with security redactor
 logging.basicConfig(level=logging.INFO)

@@ -17,6 +17,9 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - SUPADATA_API_KEYS=${SUPADATA_API_KEYS:-}
       - WEBSHARE_PROXY=${WEBSHARE_PROXY:-}
+      - API_ENDPOINT=${API_ENDPOINT:-}
+      - API_KEY=${API_KEY:-}
+      - MODEL=${MODEL:-}
     volumes:
       - media_temp:/app/temp
       - media_uploads:/app/uploads
